@@ -1,0 +1,211 @@
+/*
+  Wearable Vitals Monitor - XIAO ESP32-C3
+  Sensori: MAX30102 (BPM, SpO2) + MAX30205 (Temperatura Cutanea)
+  VERSION: DEBUG SpO2
+*/
+
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+// --- Sensori ---
+MAX30105 sensor;
+#define MAX30205_ADDRESS 0x48
+bool max30102_present = false;
+
+// --- Variabili MAX30102 ---
+unsigned long lastBeat = 0;
+unsigned long hrv = 0;
+float bpm = 0, filter = 0;
+bool beat = false;
+
+const int BPM_BUFFER_SIZE = 4;
+float bpmBuffer[BPM_BUFFER_SIZE];
+int bpmIdx = 0;
+int validBeats = 0;
+
+// --- Variabili SpO2 ---
+uint32_t irB[100], redB[100];
+int idx = 0, display_spo2 = 0;
+int32_t s2, heartRate;
+int8_t validSPO2, validHR;
+
+// --- Variabili Generali ---
+unsigned long startTime = 0;
+unsigned long lastTempRead = 0;
+float bodyTemp = 0.0;
+
+// ==========================================
+// SCANNER I2C
+// ==========================================
+void scansionaBus() {
+  Serial.println("\n--- SCANSIONE BUS I2C ---");
+  int trovati = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Trovato: 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+      if (addr == 0x48) Serial.println(" -> MAX30205");
+      else if (addr == 0x57) Serial.println(" -> MAX30102");
+      else Serial.println(" -> sconosciuto");
+      trovati++;
+    }
+  }
+  if (trovati == 0) Serial.println("Nessun dispositivo trovato!");
+  Serial.println("-------------------------\n");
+}
+
+// ==========================================
+// LETTURA TEMPERATURA MAX30205
+// ==========================================
+float leggiTemperaturaMAX30205() {
+  Wire.beginTransmission(MAX30205_ADDRESS);
+  Wire.write((byte)0x00);
+  if (Wire.endTransmission() != 0) return -1.0;
+
+  Wire.requestFrom((uint8_t)MAX30205_ADDRESS, (uint8_t)2);
+  if (Wire.available() == 2) {
+    uint8_t msb = Wire.read();
+    uint8_t lsb = Wire.read();
+    int16_t rawTemp = (int16_t)((msb << 8) | lsb);
+    return rawTemp * 0.00390625;
+  }
+  return -1.0;
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  unsigned long startWait = millis();
+  while (!Serial && millis() - startWait < 3000) yield();
+
+  Serial.println("\n=== Wearable Vitals Monitor ===");
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  scansionaBus();
+
+  if (sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102: OK");
+   
+    sensor.setup(60, 4, 2, 100, 411, 4096);
+    sensor.setPulseAmplitudeRed(0x3F);
+    sensor.setPulseAmplitudeIR(0x3F);
+    max30102_present = true;
+  } else {
+    Serial.println("MAX30102: NON TROVATO");
+  }
+
+  bodyTemp = leggiTemperaturaMAX30205();
+  if (bodyTemp == -1.0) {
+    Serial.println("MAX30205: NON TROVATO");
+  } else {
+    Serial.print("MAX30205: OK - Temp iniziale: ");
+    Serial.println(bodyTemp);
+  }
+}
+
+// ==========================================
+// LOOP PRINCIPALE
+// ==========================================
+void loop() {
+  unsigned long nowMillis = millis();
+
+  // 1. Temperatura asincrona
+  if (nowMillis - lastTempRead >= 1000) {
+    bodyTemp = leggiTemperaturaMAX30205();
+    lastTempRead = nowMillis;
+  }
+
+  if (!max30102_present) {
+    Serial.print("Onda:0 HRV_div10:0 BPM:0 SpO2:0 Temp:");
+    Serial.println(bodyTemp);
+    delay(500);
+    return;
+  }
+
+  // 2. Lettura MAX30102
+  sensor.check();
+  while (!sensor.available()) {
+    sensor.check();
+    yield();
+  }
+
+  long ir  = sensor.getIR();
+  long red = sensor.getRed();
+  sensor.nextSample();
+
+  // DEBUG RAW - stampa IR e RED ogni 50 campioni per non intasare
+  static int debugCount = 0;
+  if (++debugCount >= 50) {
+    Serial.print("RAW -> IR: "); Serial.print(ir);
+    Serial.print(" RED: ");      Serial.println(red);
+    debugCount = 0;
+  }
+
+  // 3. Filtro onda
+  filter = (filter * 0.94) + (ir * 0.06);
+  int onda = (ir - filter) / 10;
+
+  // 4. Rilevamento battito
+  if (onda > 12 && !beat) {
+    if (lastBeat != 0) {
+      unsigned long delta = nowMillis - lastBeat;
+      if (delta > 300 && delta < 1600) {
+        hrv = delta;
+        float instantBpm = 60000.0 / delta;
+        bpmBuffer[bpmIdx] = instantBpm;
+        bpmIdx = (bpmIdx + 1) % BPM_BUFFER_SIZE;
+        if (validBeats < BPM_BUFFER_SIZE) validBeats++;
+        float sum = 0;
+        for (int i = 0; i < validBeats; i++) sum += bpmBuffer[i];
+        bpm = sum / validBeats;
+      }
+    }
+    lastBeat = nowMillis;
+    beat = true;
+  } else if (onda < 0) {
+    beat = false;
+  }
+
+  // 5. Calcolo SpO2
+  irB[idx] = ir;
+  redB[idx] = red;
+  if (++idx >= 100) {
+    maxim_heart_rate_and_oxygen_saturation(irB, 100, redB, &s2, &validSPO2, &heartRate, &validHR);
+
+    // DEBUG SpO2
+    Serial.print("DEBUG SpO2 -> s2: ");    Serial.print(s2);
+    Serial.print(" validSPO2: ");          Serial.print(validSPO2);
+    Serial.print(" heartRate: ");          Serial.print(heartRate);
+    Serial.print(" validHR: ");            Serial.println(validHR);
+
+    if (validSPO2 && s2 > 80) display_spo2 = s2;
+    for (int i = 25; i < 100; i++) {
+      irB[i - 25] = irB[i];
+      redB[i - 25] = redB[i];
+    }
+    idx = 75;
+  }
+
+  // 6. Output Serial Plotter
+  if (ir < 50000) {
+    startTime = 0; bpm = 0; hrv = 0; display_spo2 = 0;
+    lastBeat = 0; validBeats = 0; bpmIdx = 0; idx = 0;
+    Serial.print("Onda:0 HRV_div10:0 BPM:0 SpO2:0 Temp:");
+    Serial.println(bodyTemp);
+  } else {
+    if (startTime == 0) startTime = millis();
+    bool stable = (millis() - startTime > 5000);
+    Serial.print("Onda:");       Serial.print(stable ? onda : 0);
+    Serial.print(" HRV_div10:"); Serial.print(hrv / 10.0);
+    Serial.print(" BPM:");       Serial.print(bpm);
+    Serial.print(" SpO2:");      Serial.print(display_spo2);
+    Serial.print(" Temp:");      Serial.println(bodyTemp);
+  }
+}
